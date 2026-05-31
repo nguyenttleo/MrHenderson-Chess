@@ -1,6 +1,6 @@
 # MrHenderson
 
-MrHenderson is a compact C++17 UCI chess engine. He likes naps and tuna fish.
+MrHenderson is a C++ UCI chess engine. He likes naps and tuna fish.
 
 ## Features
 
