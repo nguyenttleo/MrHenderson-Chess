@@ -1,5 +1,5 @@
 # MrHenderson
-
+![The Henderson](hendy5.jpeg)
 MrHenderson is a C++ UCI chess engine. He likes naps and tuna fish.
 
 ## Features
