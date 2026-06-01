@@ -11,6 +11,8 @@ MrHenderson is a C++ UCI chess engine. He likes naps and tuna fish.
 - Transposition table with configurable hash size
 - Capture, killer, history, and promotion move ordering
 - Simple material, piece activity, pawn-structure, and king-safety evaluation
+- MrHenderson style: modest preference for captures and simplification when
+  ahead, with shorter searches in clearly winning clock-controlled positions
 
 ## Build your own Mr. Henderson
 
@@ -81,3 +83,6 @@ and only works for an account that has not already played games.
 
 Use it only with a bot account or in contexts where engine assistance is
 allowed by the site rules.
+
+The local `lichess-bot` setup can also announce Mr Henderson's little naps in
+chat when the engine reports a comfortable advantage.

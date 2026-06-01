@@ -760,6 +760,36 @@ int piece_square_value(PieceType type, int sq, Color color, bool endgame) {
     }
 }
 
+struct MaterialProfile {
+    int white_material = 0;
+    int black_material = 0;
+    int non_king_pieces = 0;
+};
+
+MaterialProfile material_profile(const Board& board) {
+    MaterialProfile profile;
+    for (Piece piece : board.squares) {
+        if (piece == EMPTY) continue;
+        const PieceType type = type_of(piece);
+        if (type != KING) ++profile.non_king_pieces;
+        const int value = PIECE_VALUE[type];
+        if (color_of(piece) == WHITE) profile.white_material += value;
+        else profile.black_material += value;
+    }
+    return profile;
+}
+
+int mr_henderson_simplification_bonus(const MaterialProfile& profile) {
+    const int balance = profile.white_material - profile.black_material;
+    const int lead = std::abs(balance);
+    if (lead < 140) return 0;
+
+    const int captured_non_king_pieces = std::max(0, 30 - profile.non_king_pieces);
+    const int bonus_per_capture = std::min(8, 2 + lead / 300);
+    const int bonus = captured_non_king_pieces * bonus_per_capture;
+    return balance > 0 ? bonus : -bonus;
+}
+
 int evaluate(const Board& board) {
     int score = 0;
     int non_pawn_material = 0;
@@ -820,6 +850,7 @@ int evaluate(const Board& board) {
 
     if (white_bishops >= 2) score += 30;
     if (black_bishops >= 2) score -= 30;
+    score += mr_henderson_simplification_bonus(material_profile(board));
     score += board.side_to_move == WHITE ? 10 : -10;
     return board.side_to_move == WHITE ? score : -score;
 }
@@ -880,6 +911,10 @@ public:
 
         start_time = Clock::now();
         time_limit_ms = choose_time_limit(board, limits);
+        nap_mode = should_take_nap(board, limits);
+        if (nap_mode) {
+            std::cout << "info string i am ahead. too much work. small nap." << std::endl;
+        }
 
         std::vector<Move> root_moves = board.generate_legal();
         SearchResult result;
@@ -896,8 +931,13 @@ public:
             order_root_moves(board, root_moves, best_move);
             int alpha = -INF;
             int beta = INF;
-            int current_best_score = -INF;
-            Move current_best = best_move;
+            struct RootCandidate {
+                Move move;
+                int score = -INF;
+                int style = -INF;
+            };
+            std::vector<RootCandidate> candidates;
+            candidates.reserve(root_moves.size());
 
             for (const Move& move : root_moves) {
                 Undo undo;
@@ -906,16 +946,30 @@ public:
                 board.undo_move(undo);
 
                 if (should_stop()) break;
-                if (score > current_best_score) {
-                    current_best_score = score;
-                    current_best = move;
-                }
+                candidates.push_back(RootCandidate{move, score, root_style_score(board, move, score)});
                 if (score > alpha) alpha = score;
             }
 
             if (should_stop()) break;
-            best_move = current_best;
-            best_score = current_best_score;
+            if (candidates.empty()) break;
+
+            const int best_raw_score = std::max_element(candidates.begin(), candidates.end(),
+                [](const RootCandidate& a, const RootCandidate& b) {
+                    return a.score < b.score;
+                })->score;
+
+            const RootCandidate* selected = nullptr;
+            for (const RootCandidate& candidate : candidates) {
+                if (candidate.score < best_raw_score - 12) continue;
+                if (!selected ||
+                    candidate.style > selected->style ||
+                    (candidate.style == selected->style && candidate.score > selected->score)) {
+                    selected = &candidate;
+                }
+            }
+
+            best_move = selected ? selected->move : candidates.front().move;
+            best_score = selected ? selected->score : candidates.front().score;
             result.best_move = best_move;
             result.score = best_score;
             result.depth = depth;
@@ -947,6 +1001,7 @@ private:
     Clock::time_point start_time{};
     int64_t time_limit_ms = 0;
     int move_overhead_ms = 20;
+    bool nap_mode = false;
     std::atomic<bool>* stop = nullptr;
     std::array<std::array<Move, 2>, MAX_PLY> killers{};
     std::array<std::array<std::array<int, 64>, 64>, 2> history{};
@@ -964,7 +1019,20 @@ private:
         target = std::min(target, remaining / 4);
         target = std::max<int64_t>(10, target - move_overhead_ms);
         if (remaining > move_overhead_ms + 5) target = std::min(target, remaining - move_overhead_ms);
+
+        const int static_score = evaluate(board);
+        if (static_score >= 320 && target >= 250 && remaining >= 8000) {
+            target = target * (static_score >= 800 ? 60 : 75) / 100;
+            target = std::max<int64_t>(120, target);
+        }
+
         return std::max<int64_t>(1, target);
+    }
+
+    bool should_take_nap(const Board& board, const SearchLimits& limits) const {
+        if (limits.infinite || limits.depth > 0) return false;
+        if (limits.movetime_ms > 0) return false;
+        return evaluate(board) >= 320 && time_limit_ms > 0;
     }
 
     int64_t elapsed_ms() const {
@@ -1013,6 +1081,23 @@ private:
         }
         score += history[board.side_to_move][move.from][move.to];
         return score;
+    }
+
+    int root_style_score(const Board& board, const Move& move, int searched_score) const {
+        int style = searched_score;
+        const int static_score = evaluate(board);
+
+        if (is_capture(move)) {
+            const Piece victim = (move.flags & EN_PASSANT)
+                ? make_piece(opposite(board.side_to_move), PAWN)
+                : board.squares[move.to];
+            const int victim_value = victim == EMPTY ? 0 : PIECE_VALUE[type_of(victim)];
+            style += 4 + std::min(10, victim_value / 100);
+            if (static_score >= 160) style += std::min(12, static_score / 90);
+        }
+
+        if (is_promotion(move)) style += 5;
+        return style;
     }
 
     void order_moves(const Board& board, std::vector<Move>& moves, const Move& tt_move, int ply) const {
