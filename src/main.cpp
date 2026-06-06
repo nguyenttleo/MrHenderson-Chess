@@ -52,6 +52,16 @@ enum CastlingRight : int {
     BLACK_OOO = 1 << 3
 };
 
+enum Personality : int { BALANCED = 0, SLEEPY = 1, HUNGRY = 2, GRUMPY = 3 };
+enum ChattyMode : int { CHAT_OFF = 0, CHAT_RARE = 1, CHAT_NORMAL = 2 };
+
+struct PersonalityConfig {
+    Personality personality = SLEEPY;
+    ChattyMode chatty = CHAT_NORMAL;
+    int nap_threshold_cp = 320;
+    int tuna_mode = 60;
+};
+
 constexpr std::array<int, 6> PIECE_VALUE = {100, 320, 330, 500, 900, 0};
 constexpr const char* STANDARD_START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -173,6 +183,11 @@ std::string move_to_uci(const Move& move) {
     if (move.from < 0 || move.to < 0) return "0000";
     std::string text = square_to_string(move.from) + square_to_string(move.to);
     if (move.promotion != NO_PIECE_TYPE) text.push_back(promotion_to_char(move.promotion));
+    return text;
+}
+
+std::string lowercase(std::string text) {
+    for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return text;
 }
 
@@ -764,6 +779,8 @@ struct MaterialProfile {
     int white_material = 0;
     int black_material = 0;
     int non_king_pieces = 0;
+    int non_pawn_material = 0;
+    int queens = 0;
 };
 
 MaterialProfile material_profile(const Board& board) {
@@ -772,6 +789,8 @@ MaterialProfile material_profile(const Board& board) {
         if (piece == EMPTY) continue;
         const PieceType type = type_of(piece);
         if (type != KING) ++profile.non_king_pieces;
+        if (type != PAWN && type != KING) profile.non_pawn_material += PIECE_VALUE[type];
+        if (type == QUEEN) ++profile.queens;
         const int value = PIECE_VALUE[type];
         if (color_of(piece) == WHITE) profile.white_material += value;
         else profile.black_material += value;
@@ -901,6 +920,29 @@ public:
         move_overhead_ms = std::max(0, ms);
     }
 
+    void set_personality(const std::string& value) {
+        const std::string text = lowercase(value);
+        if (text == "balanced") config.personality = BALANCED;
+        else if (text == "sleepy") config.personality = SLEEPY;
+        else if (text == "hungry") config.personality = HUNGRY;
+        else if (text == "grumpy") config.personality = GRUMPY;
+    }
+
+    void set_chatty(const std::string& value) {
+        const std::string text = lowercase(value);
+        if (text == "off") config.chatty = CHAT_OFF;
+        else if (text == "rare") config.chatty = CHAT_RARE;
+        else if (text == "normal") config.chatty = CHAT_NORMAL;
+    }
+
+    void set_nap_threshold(int cp) {
+        config.nap_threshold_cp = std::max(120, std::min(1200, cp));
+    }
+
+    void set_tuna_mode(int value) {
+        config.tuna_mode = std::max(0, std::min(100, value));
+    }
+
     SearchResult search(Board board, const SearchLimits& limits, std::atomic<bool>& stop_signal) {
         stop = &stop_signal;
         nodes = 0;
@@ -960,7 +1002,11 @@ public:
 
             const RootCandidate* selected = nullptr;
             for (const RootCandidate& candidate : candidates) {
-                if (candidate.score < best_raw_score - 12) continue;
+                int acceptable_margin = style_margin();
+                if (catalan_opening_preference(board, candidate.move) > 0) {
+                    acceptable_margin += 24;
+                }
+                if (candidate.score < best_raw_score - acceptable_margin) continue;
                 if (!selected ||
                     candidate.style > selected->style ||
                     (candidate.style == selected->style && candidate.score > selected->score)) {
@@ -1002,6 +1048,7 @@ private:
     int64_t time_limit_ms = 0;
     int move_overhead_ms = 20;
     bool nap_mode = false;
+    PersonalityConfig config;
     std::atomic<bool>* stop = nullptr;
     std::array<std::array<Move, 2>, MAX_PLY> killers{};
     std::array<std::array<std::array<int, 64>, 64>, 2> history{};
@@ -1021,9 +1068,19 @@ private:
         if (remaining > move_overhead_ms + 5) target = std::min(target, remaining - move_overhead_ms);
 
         const int static_score = evaluate(board);
-        if (static_score >= 320 && target >= 250 && remaining >= 8000) {
-            target = target * (static_score >= 800 ? 60 : 75) / 100;
+        if (static_score >= config.nap_threshold_cp && target >= 250 && remaining >= 8000) {
+            int nap_percent = static_score >= config.nap_threshold_cp * 2 ? 60 : 75;
+            if (config.personality == SLEEPY) nap_percent -= 10;
+            if (config.personality == GRUMPY) nap_percent += 10;
+            if (config.personality == BALANCED) nap_percent += 5;
+            nap_percent = std::max(45, std::min(90, nap_percent));
+            target = target * nap_percent / 100;
             target = std::max<int64_t>(120, target);
+        } else if (static_score <= -config.nap_threshold_cp / 2 && target >= 200 && remaining >= 5000) {
+            int wake_percent = 120;
+            if (config.personality == GRUMPY) wake_percent += 15;
+            if (config.personality == SLEEPY) wake_percent -= 5;
+            target = std::min(remaining / 3, target * wake_percent / 100);
         }
 
         return std::max<int64_t>(1, target);
@@ -1032,7 +1089,7 @@ private:
     bool should_take_nap(const Board& board, const SearchLimits& limits) const {
         if (limits.infinite || limits.depth > 0) return false;
         if (limits.movetime_ms > 0) return false;
-        return evaluate(board) >= 320 && time_limit_ms > 0;
+        return config.chatty != CHAT_OFF && evaluate(board) >= config.nap_threshold_cp && time_limit_ms > 0;
     }
 
     int64_t elapsed_ms() const {
@@ -1066,6 +1123,56 @@ private:
         }
     }
 
+    int style_margin() const {
+        int margin = 8 + config.tuna_mode / 20;
+        if (config.personality == SLEEPY) margin += 2;
+        if (config.personality == HUNGRY) margin += 4;
+        if (config.personality == GRUMPY) margin -= 1;
+        if (config.personality == BALANCED) margin -= 2;
+        return std::max(6, std::min(16, margin));
+    }
+
+    int capture_personality_bonus() const {
+        int bonus = 2 + config.tuna_mode / 12;
+        if (config.personality == HUNGRY) bonus += 5;
+        if (config.personality == SLEEPY) bonus += 2;
+        if (config.personality == BALANCED) bonus -= 1;
+        return std::max(0, bonus);
+    }
+
+    bool gives_check(Board board, const Move& move) const {
+        Undo undo;
+        board.make_move(move, undo);
+        return board.is_in_check(board.side_to_move);
+    }
+
+    int catalan_opening_preference(const Board& board, const Move& move) const {
+        if (board.fullmove_number > 10) return 0;
+
+        const std::string uci = move_to_uci(move);
+        int bonus = 0;
+        if (board.side_to_move == WHITE) {
+            if (uci == "d2d4") bonus += 28;
+            else if (uci == "c2c4") bonus += 24;
+            else if (uci == "g2g3") bonus += 26;
+            else if (uci == "g1f3") bonus += 14;
+            else if (uci == "f1g2") bonus += 28;
+            else if (uci == "e2e3") bonus += 5;
+            else if (uci == "b1d2") bonus += 4;
+        } else {
+            if (uci == "d7d5") bonus += 8;
+            else if (uci == "g8f6") bonus += 8;
+            else if (uci == "e7e6") bonus += 8;
+            else if (uci == "f8e7") bonus += 6;
+            else if (uci == "c7c6") bonus += 5;
+            else if (uci == "b8d7") bonus += 4;
+            else if (uci == "c7c5") bonus += 3;
+        }
+
+        if (type_of(board.squares[move.from]) == QUEEN && board.fullmove_number <= 8) bonus -= 8;
+        return bonus;
+    }
+
     int score_move(const Board& board, const Move& move, const Move& tt_move, int ply) const {
         if (same_move(move, tt_move)) return 1'000'000;
         int score = 0;
@@ -1073,6 +1180,7 @@ private:
             Piece victim = (move.flags & EN_PASSANT) ? make_piece(opposite(board.side_to_move), PAWN) : board.squares[move.to];
             Piece attacker = board.squares[move.from];
             score += 100'000 + PIECE_VALUE[type_of(victim)] * 10 - PIECE_VALUE[type_of(attacker)];
+            score += capture_personality_bonus();
         }
         if (is_promotion(move)) score += 80'000 + PIECE_VALUE[move.promotion];
         if (ply < MAX_PLY) {
@@ -1086,17 +1194,33 @@ private:
     int root_style_score(const Board& board, const Move& move, int searched_score) const {
         int style = searched_score;
         const int static_score = evaluate(board);
+        const MaterialProfile profile = material_profile(board);
+        const bool ahead = static_score >= config.nap_threshold_cp / 2;
+        const bool endgame = profile.non_pawn_material <= 2400;
 
         if (is_capture(move)) {
             const Piece victim = (move.flags & EN_PASSANT)
                 ? make_piece(opposite(board.side_to_move), PAWN)
                 : board.squares[move.to];
             const int victim_value = victim == EMPTY ? 0 : PIECE_VALUE[type_of(victim)];
-            style += 4 + std::min(10, victim_value / 100);
-            if (static_score >= 160) style += std::min(12, static_score / 90);
+            style += capture_personality_bonus() + std::min(12, victim_value / 90);
+            if (ahead) style += std::min(14, static_score / 80);
+            if (victim != EMPTY && type_of(victim) == QUEEN) style += 6;
         }
 
-        if (is_promotion(move)) style += 5;
+        if (is_promotion(move)) style += endgame ? 12 : 5;
+        style += catalan_opening_preference(board, move);
+
+        if (board.is_in_check(board.side_to_move) || static_score <= -160) {
+            if (gives_check(board, move)) style += config.personality == GRUMPY ? 14 : 7;
+            if (is_capture(move)) style += config.personality == GRUMPY ? 8 : 3;
+        }
+
+        if (ahead && endgame) {
+            if (is_capture(move)) style += 8;
+            if (gives_check(board, move)) style += 2;
+        }
+
         return style;
     }
 
@@ -1348,6 +1472,10 @@ private:
         std::cout << "id author Leonardo Nguyen" << std::endl;
         std::cout << "option name Hash type spin default 64 min 1 max 1024" << std::endl;
         std::cout << "option name Move Overhead type spin default 20 min 0 max 5000" << std::endl;
+        std::cout << "option name Personality type combo default Sleepy var Balanced var Sleepy var Hungry var Grumpy" << std::endl;
+        std::cout << "option name Nap Threshold type spin default 320 min 120 max 1200" << std::endl;
+        std::cout << "option name Tuna Mode type spin default 60 min 0 max 100" << std::endl;
+        std::cout << "option name Chatty type combo default Normal var Off var Rare var Normal" << std::endl;
         std::cout << "option name Clear Hash type button" << std::endl;
         std::cout << "uciok" << std::endl;
     }
@@ -1382,6 +1510,14 @@ private:
             searcher.resize_hash(std::atoi(value.c_str()));
         } else if (name == "Move Overhead" && !value.empty()) {
             searcher.set_move_overhead(std::atoi(value.c_str()));
+        } else if (name == "Personality" && !value.empty()) {
+            searcher.set_personality(value);
+        } else if (name == "Nap Threshold" && !value.empty()) {
+            searcher.set_nap_threshold(std::atoi(value.c_str()));
+        } else if (name == "Tuna Mode" && !value.empty()) {
+            searcher.set_tuna_mode(std::atoi(value.c_str()));
+        } else if (name == "Chatty" && !value.empty()) {
+            searcher.set_chatty(value);
         } else if (name == "Clear Hash") {
             searcher.clear_hash();
         }

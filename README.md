@@ -13,6 +13,24 @@ MrHenderson is a C++ UCI chess engine. He likes naps and tuna fish.
 - Simple material, piece activity, pawn-structure, and king-safety evaluation
 - MrHenderson style: modest preference for captures and simplification when
   ahead, with shorter searches in clearly winning clock-controlled positions
+- Catalan-friendly opening bias through small tie-break bonuses for `d4`,
+  `c4`, `g3`, `Nf3`, and `Bg2` setups
+
+## Personality Options
+
+MrHenderson exposes a few UCI options that let a GUI or `lichess-bot` tune his
+character without turning him into a joke engine:
+
+```text
+Personality: Balanced, Sleepy, Hungry, or Grumpy
+Nap Threshold: centipawn lead before he starts saving time
+Tuna Mode: capture/simplification preference from 0 to 100
+Chatty: Off, Rare, or Normal
+```
+
+The default personality is `Sleepy`: he likes Catalan structures, takes pieces
+when the position allows it, simplifies winning positions, and spends a little
+less time when the win is comfortable.
 
 ## Build your own Mr. Henderson
 
