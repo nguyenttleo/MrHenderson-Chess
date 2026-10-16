@@ -10,6 +10,7 @@ MrHenderson is a C++ UCI chess engine. He likes naps and tuna fish.
 - Iterative deepening alpha-beta search
 - Quiescence search for tactical stability
 - Transposition table with configurable hash size
+- Repetition and fifty-move draw detection with history-aware transposition scores
 - Capture, killer, history, and promotion move ordering
 - Simple material, piece activity, pawn-structure, and king-safety evaluation
 - MrHenderson style: modest preference for captures and simplification when
@@ -33,6 +34,10 @@ The default personality is `Sleepy`: he likes Catalan structures, takes pieces
 when the position allows it, simplifies winning positions, and spends a little
 less time when the win is comfortable.
 
+Personality choices stay within a small verified evaluation margin of the best
+move. Forced mates take priority over style. Naps require a stable advantage
+across consecutive completed searches, and never start while he is in check.
+
 ## Build your own Mr. Henderson
 
 With CMake:
@@ -53,6 +58,30 @@ Or directly with MinGW:
 ```powershell
 g++ -std=c++17 -O3 -DNDEBUG src/main.cpp -o MrHenderson.exe
 ```
+
+## Search tests
+
+The CMake build includes regression tests for move generation, quiescence mates
+and stalemates, draw history, transposition scores, and personality move safety:
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
+To compare a saved older executable with the new build, install `python-chess`
+for the optional match runner. The engine itself has no Python dependency.
+
+```powershell
+python -m pip install python-chess
+python tools/compare_engines.py baseline.exe build/MrHenderson.exe --games 40 --movetime 0.15 --jobs 2 --output build/comparison-fast
+python tools/compare_engines.py baseline.exe build/MrHenderson.exe --games 8 --clock 30 --increment 0.2 --jobs 2 --output build/comparison-clock
+```
+
+For multi-configuration generators, use `build/Release/MrHenderson.exe` instead.
+Both engines use their default personality and a 64 MiB hash. The runner reverses
+colors for each opening and saves JSON results and PGNs. A game that reaches
+the move cap stays unfinished and is excluded from the score. These matches
+measure progress against the saved version; they do not establish a public Elo.
 
 ## Quick UCI Test
 
