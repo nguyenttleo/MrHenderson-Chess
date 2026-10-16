@@ -1,4 +1,4 @@
-"""Compare two UCI engines with paired openings; requires python-chess."""
+"""Run paired UCI matches"""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed

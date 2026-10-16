@@ -1055,7 +1055,7 @@ public:
                 ? 0 : style_margin();
             for (RootCandidate& candidate : candidates) {
                 if (candidate.score < best_raw_score - acceptable_margin) continue;
-                // A bound cannot establish that a personality move is safe
+                // Verify bounds before applying style
                 if (!candidate.exact) {
                     Undo undo;
                     push_move(board, candidate.move, undo);
@@ -1221,7 +1221,7 @@ private:
     }
 
     uint64_t tt_key(const Board& board) const {
-        // Draw claims depend on the reversible history as well as the board
+        // Draw history affects cached scores
         return board.hash ^ history_mix(history_contexts.back()) ^
             history_mix(static_cast<uint64_t>(board.halfmove_clock));
     }
