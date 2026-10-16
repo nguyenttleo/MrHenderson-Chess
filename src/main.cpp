@@ -254,11 +254,14 @@ public:
 
     Board() { set_startpos(); }
 
+    std::vector<uint64_t> position_history;
+
     void set_startpos() {
         set_from_fen(STANDARD_START_FEN);
     }
 
     bool set_from_fen(const std::string& fen) {
+        position_history.clear();
         squares.fill(EMPTY);
         king_square = {{-1, -1}};
         side_to_move = WHITE;
@@ -308,6 +311,7 @@ public:
         if (castling_part.find('q') != std::string::npos) castling |= BLACK_OOO;
         ep_square = ep_part == "-" ? -1 : parse_square(ep_part);
         hash = compute_hash();
+        position_history.push_back(repetition_key());
         return true;
     }
 
@@ -435,6 +439,27 @@ public:
         return is_square_attacked(king_square[color], opposite(color));
     }
 
+    uint64_t repetition_key() const {
+        if (ep_square < 0) return hash;
+        const int pawn_rank = rank_of(ep_square) + (side_to_move == WHITE ? -1 : 1);
+        const int captured_sq = ep_square + (side_to_move == WHITE ? -8 : 8);
+        if (on_board(file_of(ep_square), pawn_rank) && squares[ep_square] == EMPTY &&
+            squares[captured_sq] == make_piece(opposite(side_to_move), PAWN)) {
+            for (int df : {-1, 1}) {
+                const int file = file_of(ep_square) + df;
+                if (!on_board(file, pawn_rank)) continue;
+                const int from = make_square(file, pawn_rank);
+                if (squares[from] != make_piece(side_to_move, PAWN)) continue;
+                Board copy = *this;
+                Undo undo;
+                copy.make_move(Move{from, ep_square, NO_PIECE_TYPE,
+                    static_cast<uint8_t>(CAPTURE | EN_PASSANT)}, undo);
+                if (!copy.is_in_check(side_to_move)) return hash;
+            }
+        }
+        return hash ^ zobrist().ep_file[file_of(ep_square)];
+    }
+
     std::vector<Move> generate_legal(bool tactical_only = false) {
         std::vector<Move> pseudo;
         pseudo.reserve(96);
@@ -450,6 +475,21 @@ public:
             undo_move(undo);
         }
         return legal;
+    }
+
+    bool has_legal_move() {
+        std::vector<Move> moves;
+        moves.reserve(96);
+        generate_pseudo(moves, false);
+        const Color us = side_to_move;
+        for (const Move& move : moves) {
+            Undo undo;
+            make_move(move, undo);
+            const bool legal = !is_in_check(us);
+            undo_move(undo);
+            if (legal) return true;
+        }
+        return false;
     }
 
     void make_move(const Move& move, Undo& undo) {
@@ -953,46 +993,56 @@ public:
 
         start_time = Clock::now();
         time_limit_ms = choose_time_limit(board, limits);
-        nap_mode = should_take_nap(board, limits);
-        if (nap_mode) {
-            std::cout << "info string i am ahead. too much work. small nap." << std::endl;
-        }
+        nap_mode = false;
+        aborted = false;
+        prepare_history(board);
 
         std::vector<Move> root_moves = board.generate_legal();
         SearchResult result;
         result.nodes = 0;
-        if (root_moves.empty()) return result;
+        if (root_moves.empty()) {
+            result.score = board.is_in_check(board.side_to_move) ? -MATE_SCORE : 0;
+            return result;
+        }
+        if (is_draw(board)) {
+            result.best_move = root_moves.front();
+            print_info(0, 0, 0, result.best_move);
+            return result;
+        }
 
         Move best_move = root_moves.front();
         int best_score = -INF;
         const int max_depth = limits.depth > 0 ? limits.depth : 64;
+        const bool root_in_check = board.is_in_check(board.side_to_move);
+        int previous_raw_score = -INF;
 
         for (int depth = 1; depth <= max_depth; ++depth) {
-            if (should_stop()) break;
+            if (should_stop(true)) break;
 
             order_root_moves(board, root_moves, best_move);
             int alpha = -INF;
-            int beta = INF;
             struct RootCandidate {
                 Move move;
                 int score = -INF;
                 int style = -INF;
+                bool exact = false;
             };
             std::vector<RootCandidate> candidates;
             candidates.reserve(root_moves.size());
 
             for (const Move& move : root_moves) {
+                const int root_alpha = alpha == -INF ? -INF : alpha - style_margin();
                 Undo undo;
-                board.make_move(move, undo);
-                int score = -negamax(board, depth - 1, -beta, -alpha, 1);
-                board.undo_move(undo);
+                push_move(board, move, undo);
+                int score = -negamax(board, depth - 1, -INF, -root_alpha, 1);
+                pop_move(board, undo);
 
-                if (should_stop()) break;
-                candidates.push_back(RootCandidate{move, score, root_style_score(board, move, score)});
+                if (should_stop(true)) break;
+                candidates.push_back(RootCandidate{move, score, 0, score > root_alpha});
                 if (score > alpha) alpha = score;
             }
 
-            if (should_stop()) break;
+            if (should_stop(true)) break;
             if (candidates.empty()) break;
 
             const int best_raw_score = std::max_element(candidates.begin(), candidates.end(),
@@ -1001,18 +1051,27 @@ public:
                 })->score;
 
             const RootCandidate* selected = nullptr;
-            for (const RootCandidate& candidate : candidates) {
-                int acceptable_margin = style_margin();
-                if (catalan_opening_preference(board, candidate.move) > 0) {
-                    acceptable_margin += 24;
-                }
+            const int acceptable_margin = std::abs(best_raw_score) >= MATE_SCORE - MAX_PLY
+                ? 0 : style_margin();
+            for (RootCandidate& candidate : candidates) {
                 if (candidate.score < best_raw_score - acceptable_margin) continue;
+                // A bound cannot establish that a personality move is safe
+                if (!candidate.exact) {
+                    Undo undo;
+                    push_move(board, candidate.move, undo);
+                    candidate.score = -negamax(board, depth - 1, -INF, INF, 1);
+                    pop_move(board, undo);
+                    if (should_stop(true)) break;
+                    if (candidate.score < best_raw_score - acceptable_margin) continue;
+                }
+                candidate.style = root_style_score(board, candidate.move, candidate.score);
                 if (!selected ||
                     candidate.style > selected->style ||
                     (candidate.style == selected->style && candidate.score > selected->score)) {
                     selected = &candidate;
                 }
             }
+            if (should_stop(true)) break;
 
             best_move = selected ? selected->move : candidates.front().move;
             best_score = selected ? selected->score : candidates.front().score;
@@ -1023,6 +1082,16 @@ public:
             print_info(depth, best_score, nodes, best_move);
 
             if (std::abs(best_score) > MATE_SCORE - MAX_PLY) break;
+            if (!nap_mode && can_take_nap(board, limits) && !root_in_check && depth >= 4 &&
+                best_score >= config.nap_threshold_cp && previous_raw_score >= config.nap_threshold_cp &&
+                std::abs(best_raw_score - previous_raw_score) <= 40) {
+                nap_mode = true;
+                time_limit_ms = std::max<int64_t>(120, time_limit_ms * nap_percent(best_score) / 100);
+                if (config.chatty != CHAT_OFF) {
+                    std::cout << "info string i am ahead. too much work. small nap." << std::endl;
+                }
+            }
+            previous_raw_score = best_raw_score;
             if (!limits.infinite && time_limit_ms > 0 && elapsed_ms() > time_limit_ms * 7 / 10 && depth >= 4) break;
         }
 
@@ -1036,6 +1105,7 @@ public:
     }
 
 private:
+    friend struct SearchTests;
     using Clock = std::chrono::steady_clock;
 
     static constexpr uint8_t TT_EXACT = 0;
@@ -1048,6 +1118,9 @@ private:
     int64_t time_limit_ms = 0;
     int move_overhead_ms = 20;
     bool nap_mode = false;
+    bool aborted = false;
+    std::vector<uint64_t> position_keys;
+    std::vector<uint64_t> history_contexts;
     PersonalityConfig config;
     std::atomic<bool>* stop = nullptr;
     std::array<std::array<Move, 2>, MAX_PLY> killers{};
@@ -1068,15 +1141,7 @@ private:
         if (remaining > move_overhead_ms + 5) target = std::min(target, remaining - move_overhead_ms);
 
         const int static_score = evaluate(board);
-        if (static_score >= config.nap_threshold_cp && target >= 250 && remaining >= 8000) {
-            int nap_percent = static_score >= config.nap_threshold_cp * 2 ? 60 : 75;
-            if (config.personality == SLEEPY) nap_percent -= 10;
-            if (config.personality == GRUMPY) nap_percent += 10;
-            if (config.personality == BALANCED) nap_percent += 5;
-            nap_percent = std::max(45, std::min(90, nap_percent));
-            target = target * nap_percent / 100;
-            target = std::max<int64_t>(120, target);
-        } else if (static_score <= -config.nap_threshold_cp / 2 && target >= 200 && remaining >= 5000) {
+        if (static_score <= -config.nap_threshold_cp / 2 && target >= 200 && remaining >= 5000) {
             int wake_percent = 120;
             if (config.personality == GRUMPY) wake_percent += 15;
             if (config.personality == SLEEPY) wake_percent -= 5;
@@ -1086,21 +1151,91 @@ private:
         return std::max<int64_t>(1, target);
     }
 
-    bool should_take_nap(const Board& board, const SearchLimits& limits) const {
-        if (limits.infinite || limits.depth > 0) return false;
-        if (limits.movetime_ms > 0) return false;
-        return config.chatty != CHAT_OFF && evaluate(board) >= config.nap_threshold_cp && time_limit_ms > 0;
+    bool can_take_nap(const Board& board, const SearchLimits& limits) const {
+        const int64_t remaining = board.side_to_move == WHITE ? limits.white_time_ms : limits.black_time_ms;
+        return !limits.infinite && limits.depth == 0 && limits.movetime_ms == 0 &&
+            remaining >= 8000 && time_limit_ms >= 250;
+    }
+
+    int nap_percent(int score) const {
+        int percent = score >= config.nap_threshold_cp * 2 ? 60 : 75;
+        if (config.personality == SLEEPY) percent -= 10;
+        if (config.personality == GRUMPY) percent += 10;
+        if (config.personality == BALANCED) percent += 5;
+        return std::max(45, std::min(90, percent));
     }
 
     int64_t elapsed_ms() const {
         return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start_time).count();
     }
 
-    bool should_stop() const {
-        if (stop && stop->load(std::memory_order_relaxed)) return true;
+    bool should_stop(bool force_time_check = false) {
+        if (aborted) return true;
+        if (stop && stop->load(std::memory_order_relaxed)) return aborted = true;
         if (time_limit_ms <= 0) return false;
-        if ((nodes & 2047ULL) != 0) return false;
-        return elapsed_ms() >= time_limit_ms;
+        if (!force_time_check && (nodes & 1023ULL) != 0) return false;
+        return aborted = elapsed_ms() >= time_limit_ms;
+    }
+
+    static uint64_t history_mix(uint64_t key) {
+        return splitmix64(key);
+    }
+
+    void prepare_history(const Board& board) {
+        position_keys = board.position_history;
+        if (position_keys.empty() || position_keys.back() != board.repetition_key()) {
+            position_keys.push_back(board.repetition_key());
+        }
+        uint64_t context = 0;
+        const std::size_t count = std::min(position_keys.size(),
+            static_cast<std::size_t>(board.halfmove_clock) + 1);
+        for (std::size_t i = position_keys.size() - count; i < position_keys.size(); ++i) {
+            context += history_mix(position_keys[i]);
+        }
+        history_contexts.assign(1, context);
+    }
+
+    void push_move(Board& board, const Move& move, Undo& undo) {
+        board.make_move(move, undo);
+        const uint64_t key = board.repetition_key();
+        position_keys.push_back(key);
+        const uint64_t context = board.halfmove_clock == 0 ? 0 : history_contexts.back();
+        history_contexts.push_back(context + history_mix(key));
+    }
+
+    void pop_move(Board& board, const Undo& undo) {
+        history_contexts.pop_back();
+        position_keys.pop_back();
+        board.undo_move(undo);
+    }
+
+    bool is_draw(const Board& board) const {
+        if (board.halfmove_clock >= 100) return true;
+        int occurrences = 0;
+        const std::size_t count = std::min(position_keys.size(),
+            static_cast<std::size_t>(board.halfmove_clock) + 1);
+        for (std::size_t i = position_keys.size() - count; i < position_keys.size(); ++i) {
+            if (position_keys[i] == position_keys.back() && ++occurrences >= 3) return true;
+        }
+        return false;
+    }
+
+    uint64_t tt_key(const Board& board) const {
+        // Draw claims depend on the reversible history as well as the board
+        return board.hash ^ history_mix(history_contexts.back()) ^
+            history_mix(static_cast<uint64_t>(board.halfmove_clock));
+    }
+
+    static int score_to_tt(int score, int ply) {
+        if (score >= MATE_SCORE - MAX_PLY) return score + ply;
+        if (score <= -MATE_SCORE + MAX_PLY) return score - ply;
+        return score;
+    }
+
+    static int score_from_tt(int score, int ply) {
+        if (score >= MATE_SCORE - MAX_PLY) return score - ply;
+        if (score <= -MATE_SCORE + MAX_PLY) return score + ply;
+        return score;
     }
 
     TTEntry* probe(uint64_t key) {
@@ -1113,7 +1248,7 @@ private:
     void store(uint64_t key, int depth, int score, uint8_t flag, const Move& best) {
         if (table.empty()) return;
         TTEntry& entry = table[key % table.size()];
-        if (!entry.used || depth >= entry.depth) {
+        if (!entry.used || entry.key != key || depth >= entry.depth) {
             entry.used = true;
             entry.key = key;
             entry.depth = depth;
@@ -1250,22 +1385,30 @@ private:
     }
 
     int negamax(Board& board, int depth, int alpha, int beta, int ply) {
-        if (ply >= MAX_PLY - 1) return evaluate(board);
         ++nodes;
         if (should_stop()) return evaluate(board);
 
         const bool in_check = board.is_in_check(board.side_to_move);
+        if (is_draw(board)) {
+            return in_check && !board.has_legal_move() ? -MATE_SCORE + ply : 0;
+        }
+        if (ply >= MAX_PLY - 1) {
+            if (!board.has_legal_move()) return in_check ? -MATE_SCORE + ply : 0;
+            return evaluate(board);
+        }
         if (in_check) ++depth;
         if (depth <= 0) return quiescence(board, alpha, beta, ply);
 
         const int alpha_original = alpha;
+        const uint64_t key = tt_key(board);
         Move tt_move;
-        if (TTEntry* entry = probe(board.hash)) {
+        if (TTEntry* entry = probe(key)) {
             tt_move = entry->best;
             if (entry->depth >= depth) {
-                if (entry->flag == TT_EXACT) return entry->score;
-                if (entry->flag == TT_LOWER && entry->score >= beta) return entry->score;
-                if (entry->flag == TT_UPPER && entry->score <= alpha) return entry->score;
+                const int score = score_from_tt(entry->score, ply);
+                if (entry->flag == TT_EXACT) return score;
+                if (entry->flag == TT_LOWER && score >= beta) return score;
+                if (entry->flag == TT_UPPER && score <= alpha) return score;
             }
         }
 
@@ -1279,9 +1422,9 @@ private:
         int best_score = -INF;
         for (const Move& move : moves) {
             Undo undo;
-            board.make_move(move, undo);
+            push_move(board, move, undo);
             int score = -negamax(board, depth - 1, -beta, -alpha, ply + 1);
-            board.undo_move(undo);
+            pop_move(board, undo);
 
             if (should_stop()) return evaluate(board);
             if (score > best_score) {
@@ -1298,31 +1441,37 @@ private:
         uint8_t flag = TT_EXACT;
         if (best_score <= alpha_original) flag = TT_UPPER;
         else if (best_score >= beta) flag = TT_LOWER;
-        store(board.hash, depth, best_score, flag, best_move);
+        store(key, depth, score_to_tt(best_score, ply), flag, best_move);
         return best_score;
     }
 
     int quiescence(Board& board, int alpha, int beta, int ply) {
-        if (ply >= MAX_PLY - 1) return evaluate(board);
         ++nodes;
         if (should_stop()) return evaluate(board);
 
         const bool in_check = board.is_in_check(board.side_to_move);
+        if (is_draw(board)) {
+            return in_check && !board.has_legal_move() ? -MATE_SCORE + ply : 0;
+        }
+        std::vector<Move> moves = board.generate_legal(!in_check);
+        if (moves.empty() && (in_check || !board.has_legal_move())) {
+            return in_check ? -MATE_SCORE + ply : 0;
+        }
+        if (ply >= MAX_PLY - 1) return evaluate(board);
         if (!in_check) {
             const int stand_pat = evaluate(board);
             if (stand_pat >= beta) return beta;
             if (stand_pat > alpha) alpha = stand_pat;
         }
 
-        std::vector<Move> moves = board.generate_legal(!in_check);
         Move no_tt;
         order_moves(board, moves, no_tt, ply);
 
         for (const Move& move : moves) {
             Undo undo;
-            board.make_move(move, undo);
+            push_move(board, move, undo);
             int score = -quiescence(board, -beta, -alpha, ply + 1);
-            board.undo_move(undo);
+            pop_move(board, undo);
 
             if (should_stop()) return evaluate(board);
             if (score >= beta) return beta;
@@ -1553,6 +1702,7 @@ private:
             if (same_move(parsed, move)) {
                 Undo undo;
                 board.make_move(move, undo);
+                board.position_history.push_back(board.repetition_key());
                 return;
             }
         }
@@ -1654,6 +1804,7 @@ private:
 
 }  // namespace
 
+#ifndef MRHENDERSON_TESTING
 int main() {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
@@ -1662,3 +1813,4 @@ int main() {
     engine.loop();
     return 0;
 }
+#endif
